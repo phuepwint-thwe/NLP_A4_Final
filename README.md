@@ -90,9 +90,7 @@ The **Streamlit app** allows users to enter two sentences and get:
 **Cosine Similarity**  and **Natural Language Inference (NLI) Classification**  
 
 ### **Run the App Locally**
-```bash
-streamlit run app.py
----
+- streamlit run app.py
 
 ## **Sample Test Cases**  
 The model classifies sentence relationships into:  
