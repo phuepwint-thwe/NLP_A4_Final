@@ -1,3 +1,4 @@
 sentence_bert.pt filter=lfs diff=lfs merge=lfs -text
 bert_model.pt filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
 * !text !filter !merge !diff
