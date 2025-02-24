@@ -1,0 +1,5 @@
+/myvenv
+app/__pycache__
+app/.pytest_cache
+*.log
+*.tmp
