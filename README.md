@@ -58,17 +58,17 @@ This project uses **100,000 samples** from the **BookCorpus dataset**, a large-s
 
 ## **Training Configuration**
 ### **Hyperparameters**
-| Parameter        | Value   |
-|-----------------|---------|
-| Vocab Size      | 23,069  |
-| Batch Size      | 4       |
-| Epochs          | 100     |
-| Layers (n)      | 6       |
-| Heads (n)       | 8       |
-| Model Dim (d)   | 768     |
-| Feedforward Dim | 768 * 4 |
-| Segments (n)    | 2       |
-| Max Mask Tokens | 5       |
+| Parameter             | Value   |
+|-----------------------|---------|
+| Vocab Size            | 23,069  |
+| Batch Size            | 4       |
+| Epochs                | 100     |
+| Layers (n_layers)     | 6       |
+| Heads (n_heads)       | 8       |
+| Model Dim(d_model)    | 768     |
+| Feedforward Dim (d_ff)| 768 * 4 |
+| Segments (n_segments) | 2       |
+| Max Mask Tokens       | 5       |
 
 ---
 
