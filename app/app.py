@@ -16,18 +16,23 @@ text = [x.lower() for x in sentences] #lower case
 text = [re.sub("[.,!?\\-]", '', x) for x in text]
 
 
-word_list = list(set(" ".join(text).split()))
-word2id   = {'[PAD]': 0, '[CLS]': 1, '[SEP]': 2, '[MASK]': 3}
+# Set up device for PyTorch
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Load dataset for vocabulary
+dataset = load_dataset('bookcorpus', split='train[:1%]')
+dataset = dataset.select(range(100000))
+sentences = dataset['text']
+text = [x.lower() for x in sentences]
+text = [re.sub("[.,!?\\-]", '', x) for x in text]
+
+# Build vocabulary
+word_list = list(set(" ".join(text).split()))
+word2id = {'[PAD]': 0, '[CLS]': 1, '[SEP]': 2, '[MASK]': 3, '[UNK]': 4}
 for i, w in enumerate(word_list):
-    word2id[w] = i + 4 #reserve the first 0-3 for CLS, PAD
-    id2word    = {i:w for i, w  in enumerate(word2id)}
-    vocab_size = len(word2id)
-    
-token_list = list()
-for sentence in text:
-    arr = [word2id[word] for word in sentence.split()]
-    token_list.append(arr)
+    word2id[w] = i + 5
+id2word = {i: w for w, i in word2id.items()}
+vocab_size = len(word2id)
 
 batch_size = 10
 max_len    = 1000 #maximum length that my transformer will accept.....all sentence will be padded to this length
@@ -40,222 +45,286 @@ d_k = d_v  = 64
 n_segments = 2
 
 class Embedding(nn.Module):
-    def __init__(self):
+    def __init__(self, vocab_size, max_len, n_segments, d_model, device):
         super(Embedding, self).__init__()
-        self.tok_embed = nn.Embedding(vocab_size, d_model)
-        self.pos_embed = nn.Embedding(max_len, d_model)
-        self.seg_embed = nn.Embedding(n_segments, d_model)
+        self.tok_embed = nn.Embedding(vocab_size, d_model)  # token embedding
+        self.pos_embed = nn.Embedding(max_len, d_model)      # position embedding
+        self.seg_embed = nn.Embedding(n_segments, d_model)  # segment(token type) embedding
         self.norm = nn.LayerNorm(d_model)
+        self.device = device
 
     def forward(self, x, seg):
+        #x, seg: (bs, len)
         seq_len = x.size(1)
-        pos = torch.arange(seq_len, dtype=torch.long, device=x.device).unsqueeze(0).expand_as(x)
+        pos = torch.arange(seq_len, dtype=torch.long).to(self.device)
+        pos = pos.unsqueeze(0).expand_as(x)  # (len,) -> (bs, len)
         embedding = self.tok_embed(x) + self.pos_embed(pos) + self.seg_embed(seg)
         return self.norm(embedding)
 
-def get_attn_pad_mask(seq_q, seq_k):
-    # Create mask for PAD tokens (assumed to be 0)
-    pad_attn_mask = seq_k.eq(0).unsqueeze(1)  # shape: [batch, 1, len_k]
-    return pad_attn_mask.expand(seq_q.size(0), seq_q.size(1), seq_k.size(1))
+def get_attn_pad_mask(seq_q, seq_k, device):
+    batch_size, len_q = seq_q.size()
+    batch_size, len_k = seq_k.size()
+    # eq(zero) is PAD token
+    pad_attn_mask = seq_k.data.eq(0).unsqueeze(1).to(device)  # batch_size x 1 x len_k(=len_q), one is masking
+    return pad_attn_mask.expand(batch_size, len_q, len_k)  # batch_size x len_q x len_k
+
+class EncoderLayer(nn.Module):
+    def __init__(self, n_heads, d_model, d_ff, d_k, device):
+        super(EncoderLayer, self).__init__()
+        self.enc_self_attn = MultiHeadAttention(n_heads, d_model, d_k, device)
+        self.pos_ffn       = PoswiseFeedForwardNet(d_model, d_ff)
+
+    def forward(self, enc_inputs, enc_self_attn_mask):
+        enc_outputs, attn = self.enc_self_attn(enc_inputs, enc_inputs, enc_inputs, enc_self_attn_mask) # enc_inputs to same Q,K,V
+        enc_outputs = self.pos_ffn(enc_outputs) # enc_outputs: [batch_size x len_q x d_model]
+        return enc_outputs, attn
 
 class ScaledDotProductAttention(nn.Module):
+    def __init__(self, d_k, device):
+        super(ScaledDotProductAttention, self).__init__()
+        self.scale = torch.sqrt(torch.FloatTensor([d_k])).to(device)
+
     def forward(self, Q, K, V, attn_mask):
-        scores = torch.matmul(Q, K.transpose(-1, -2)) / np.sqrt(d_k)
-        scores.masked_fill_(attn_mask, -1e9)
-        attn = F.softmax(scores, dim=-1)
+        scores = torch.matmul(Q, K.transpose(-1, -2)) / self.scale # scores : [batch_size x n_heads x len_q(=len_k) x len_k(=len_q)]
+        scores.masked_fill_(attn_mask, -1e9) # Fills elements of self tensor with value where mask is one.
+        attn = nn.Softmax(dim=-1)(scores)
         context = torch.matmul(attn, V)
-        return context, attn
+        return context, attn 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self):
+    def __init__(self, n_heads, d_model, d_k, device):
         super(MultiHeadAttention, self).__init__()
+        self.n_heads = n_heads
+        self.d_model = d_model
+        self.d_k = d_k
+        self.d_v = d_k
         self.W_Q = nn.Linear(d_model, d_k * n_heads)
         self.W_K = nn.Linear(d_model, d_k * n_heads)
-        self.W_V = nn.Linear(d_model, d_v * n_heads)
-        self.fc  = nn.Linear(n_heads * d_v, d_model)
-        self.norm = nn.LayerNorm(d_model)
-
+        self.W_V = nn.Linear(d_model, self.d_v * n_heads)
+        self.device = device
     def forward(self, Q, K, V, attn_mask):
-        residual = Q
-        batch_size = Q.size(0)
-        # Project and split into multiple heads
-        q = self.W_Q(Q).view(batch_size, -1, n_heads, d_k).transpose(1, 2)
-        k = self.W_K(K).view(batch_size, -1, n_heads, d_k).transpose(1, 2)
-        v = self.W_V(V).view(batch_size, -1, n_heads, d_v).transpose(1, 2)
-        attn_mask = attn_mask.unsqueeze(1).repeat(1, n_heads, 1, 1)
-        context, attn = ScaledDotProductAttention()(q, k, v, attn_mask)
-        context = context.transpose(1, 2).contiguous().view(batch_size, -1, n_heads * d_v)
-        output = self.fc(context)
-        return self.norm(output + residual), attn
+        # q: [batch_size x len_q x d_model], k: [batch_size x len_k x d_model], v: [batch_size x len_k x d_model]
+        residual, batch_size = Q, Q.size(0)
+        # (B, S, D) -proj-> (B, S, D) -split-> (B, S, H, W) -trans-> (B, H, S, W)
+        q_s = self.W_Q(Q).view(batch_size, -1, self.n_heads, self.d_k).transpose(1,2)  # q_s: [batch_size x n_heads x len_q x d_k]
+        k_s = self.W_K(K).view(batch_size, -1, self.n_heads, self.d_k).transpose(1,2)  # k_s: [batch_size x n_heads x len_k x d_k]
+        v_s = self.W_V(V).view(batch_size, -1, self.n_heads, self.d_v).transpose(1,2)  # v_s: [batch_size x n_heads x len_k x d_v]
+
+        attn_mask = attn_mask.unsqueeze(1).repeat(1, self.n_heads, 1, 1) # attn_mask : [batch_size x n_heads x len_q x len_k]
+
+        # context: [batch_size x n_heads x len_q x d_v], attn: [batch_size x n_heads x len_q(=len_k) x len_k(=len_q)]
+        context, attn = ScaledDotProductAttention(self.d_k, self.device)(q_s, k_s, v_s, attn_mask)
+        context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.n_heads * self.d_v) # context: [batch_size x len_q x n_heads * d_v]
+        output = nn.Linear(self.n_heads * self.d_v, self.d_model, device=self.device)(context)
+        return nn.LayerNorm(self.d_model, device=self.device)(output + residual), attn # output: [batch_size x len_q x d_model]
 
 class PoswiseFeedForwardNet(nn.Module):
-    def __init__(self):
+    def __init__(self, d_model, d_ff):
         super(PoswiseFeedForwardNet, self).__init__()
         self.fc1 = nn.Linear(d_model, d_ff)
         self.fc2 = nn.Linear(d_ff, d_model)
 
     def forward(self, x):
+        # (batch_size, len_seq, d_model) -> (batch_size, len_seq, d_ff) -> (batch_size, len_seq, d_model)
         return self.fc2(F.gelu(self.fc1(x)))
 
-class EncoderLayer(nn.Module):
-    def __init__(self):
-        super(EncoderLayer, self).__init__()
-        self.self_attn = MultiHeadAttention()
-        self.ffn = PoswiseFeedForwardNet()
-
-    def forward(self, enc_inputs, attn_mask):
-        enc_outputs, attn = self.self_attn(enc_inputs, enc_inputs, enc_inputs, attn_mask)
-        enc_outputs = self.ffn(enc_outputs)
-        return enc_outputs, attn
 
 class BERT(nn.Module):
     def __init__(self):
         super(BERT, self).__init__()
-        self.embedding = Embedding()
-        self.layers = nn.ModuleList([EncoderLayer() for _ in range(n_layers)])
-        # For next sentence prediction (NSP)
-        self.fc = nn.Linear(d_model, d_model)
+        self.device = device  # Store device for later use
+        self.embedding = Embedding(vocab_size, max_len, n_segments, d_model, device).to(device)
+        self.layers = nn.ModuleList([
+            EncoderLayer(n_heads, d_model, d_ff, d_k, device).to(device) for _ in range(n_layers)
+        ])
+        self.fc = nn.Linear(d_model, d_model).to(device)
         self.activ = nn.Tanh()
-        self.classifier = nn.Linear(d_model, 2)
-        # For masked language modeling (LM)
-        self.linear = nn.Linear(d_model, d_model)
-        self.norm = nn.LayerNorm(d_model)
-        # Decoder shares weights with token embedding
-        self.decoder = nn.Linear(d_model, vocab_size, bias=False)
-        self.decoder_bias = nn.Parameter(torch.zeros(vocab_size))
-        self.decoder.weight = self.embedding.tok_embed.weight
+        self.linear = nn.Linear(d_model, d_model).to(device)
+        self.norm = nn.LayerNorm(d_model).to(device)
+        self.classifier = nn.Linear(d_model, 2).to(device)
+    
+        # decoder is shared with embedding layer
+        embed_weight = self.embedding.tok_embed.weight
+        n_vocab, n_dim = embed_weight.size()
+        self.decoder = nn.Linear(n_dim, n_vocab, bias=False)
+        self.decoder.weight = embed_weight
+        self.decoder_bias = nn.Parameter(torch.zeros(n_vocab))
 
     def forward(self, input_ids, segment_ids, masked_pos):
         output = self.embedding(input_ids, segment_ids)
-        attn_mask = get_attn_pad_mask(input_ids, input_ids)
+        enc_self_attn_mask = get_attn_pad_mask(input_ids, input_ids, self.device)
         for layer in self.layers:
-            output, _ = layer(output, attn_mask)
-        # NSP: use [CLS] token (first token)
-        h_pooled = self.activ(self.fc(output[:, 0]))
-        logits_nsp = self.classifier(h_pooled)
-        # LM: gather positions for masked tokens
-        masked_pos = masked_pos.unsqueeze(-1).expand(-1, -1, output.size(-1))
-        h_masked = torch.gather(output, 1, masked_pos)
-        h_masked = self.norm(F.gelu(self.linear(h_masked)))
-        logits_lm = self.decoder(h_masked) + self.decoder_bias
+            output, enc_self_attn = layer(output, enc_self_attn_mask)
+        # output : [batch_size, len, d_model], attn : [batch_size, n_heads, d_mode, d_model]
+        
+        # 1. predict next sentence
+        # it will be decided by first token(CLS)
+        h_pooled   = self.activ(self.fc(output[:, 0])) # [batch_size, d_model]
+        logits_nsp = self.classifier(h_pooled) # [batch_size, 2]
+
+        # 2. predict the masked token
+        masked_pos = masked_pos[:, :, None].expand(-1, -1, output.size(-1)) # [batch_size, max_pred, d_model]
+        h_masked = torch.gather(output, 1, masked_pos) # masking position [batch_size, max_pred, d_model]
+        h_masked  = self.norm(F.gelu(self.linear(h_masked)))
+        logits_lm = self.decoder(h_masked) + self.decoder_bias # [batch_size, max_pred, n_vocab]
+
         return logits_lm, logits_nsp
 
 def mean_pool(token_embeds, attention_mask):
-    # Expand attention mask to match embed dimensions and compute mean
-    mask = attention_mask.unsqueeze(-1).float()
-    pooled = torch.sum(token_embeds * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
-    return pooled
+    # Ensure token_embeds and attention_mask match in length
+    seq_len_embeds = token_embeds.shape[1]
+    seq_len_mask = attention_mask.shape[1]
 
-def tokenize_sentence_model1(sentence_a, sentence_b):
-    seed(55)  # for reproducibility
-    max_seq_length = max_len
+    if seq_len_embeds != seq_len_mask:
+        print(f"Warning: Mismatch detected. Truncating attention_mask from {seq_len_mask} to {seq_len_embeds}")
+        attention_mask = attention_mask[:, :seq_len_embeds]  # Trim the mask to match embeddings
 
-    # Convert words to token ids; handle out-of-vocabulary words
-    tokens_a = [word2id[word] if word in word_list else len(word_list) for word in sentence_a.split()]
-    tokens_b = [word2id[word] if word in word_list else len(word_list) for word in sentence_b.split()]
+    # Expand mask and perform mean pooling
+    in_mask = attention_mask.unsqueeze(-1).float()  # [batch_size, seq_len, 1]
+    pool = torch.sum(token_embeds * in_mask, dim=1) / torch.clamp(in_mask.sum(dim=1), min=1e-9)
 
-    # Add special tokens
-    input_ids_a = [word2id['[CLS]']] + tokens_a + [word2id['[SEP]']]
-    input_ids_b = [word2id['[CLS]']] + tokens_b + [word2id['[SEP]']]
+    return pool
 
-    # Create segment ids (here we use all zeros)
-    segment_ids = [0] * max_seq_length
 
+def tokenize_sentence_s_model(sentence_a, sentence_b):
+    # For consistent masking behavior
+    seed(55)
+    # Global constants
+    MAX_SEQ_LENGTH = 200
+    MAX_MASK = 5
+    # Tokenize each sentence (convert words to indices)
+    premise_tokens = [word2id[word] if word in word_list else len(word_list) for word in sentence_a.split()]
+    hypothesis_tokens = [word2id[word] if word in word_list else len(word_list) for word in sentence_b.split()]
+
+    # Add special tokens: [CLS] at the beginning and [SEP] at the end
+    premise_ids = [word2id['[CLS]']] + premise_tokens + [word2id['[SEP]']]
+    hypothesis_ids = [word2id['[CLS]']] + hypothesis_tokens + [word2id['[SEP]']]
+
+    # Create segment IDs: 0 for premise and 1 for hypothesis
+    segment_ids = [0] * len(premise_ids) + [1] * len(hypothesis_ids)
+    segment_ids = segment_ids[:MAX_SEQ_LENGTH] + [0] * (MAX_SEQ_LENGTH - len(segment_ids))
+    
     def apply_masking(input_ids):
-        num_to_mask = min(max_mask, max(1, int(round(len(input_ids) * 0.15))))
-        candidates = [i for i, token in enumerate(input_ids) if token not in (word2id['[CLS]'], word2id['[SEP]'])]
-        shuffle(candidates)
-        masked_pos = []
-        for pos in candidates[:num_to_mask]:
-            masked_pos.append(pos)
+    
+        num_to_mask = min(MAX_MASK, max(1, int(round(len(input_ids) * 0.15))))
+        candidate_positions = [i for i, token in enumerate(input_ids)
+                               if token not in [word2id['[CLS]'], word2id['[SEP]']]]
+        shuffle(candidate_positions)
+        masked_tokens = []
+        masked_positions = []
+        for pos in candidate_positions[:num_to_mask]:
+            masked_positions.append(pos)
+            masked_tokens.append(input_ids[pos])
             rand_val = random()
-            if rand_val < 0.1:
-                # Replace with random token
-                input_ids[pos] = word2id[id2word[randint(0, vocab_size - 1)]]
-            elif rand_val < 0.8:
-                input_ids[pos] = word2id['[MASK]']
-            # else, leave the token unchanged
-        # Pad masked positions if necessary
-        masked_pos += [0] * (max_mask - len(masked_pos))
-        return masked_pos
+            if rand_val < 0.8:
+                input_ids[pos] = word2id['[MASK]']  # 80% [MASK]
+            elif rand_val < 0.9:
+                input_ids[pos] = word2id[id2word[randint(0, vocab_size - 1)]]  # 10% random token
+            # else: keep the original token
+        # Pad masked tokens and positions if needed
+        masked_tokens += [0] * (MAX_MASK - len(masked_tokens))
+        masked_positions += [0] * (MAX_MASK - len(masked_positions))
+        return masked_tokens[:MAX_MASK], masked_positions[:MAX_MASK]
 
-    masked_pos_a = apply_masking(input_ids_a.copy())
-    masked_pos_b = apply_masking(input_ids_b.copy())
+    # Apply masking to copies so original IDs remain intact if needed elsewhere
+    masked_tokens_premise, masked_pos_premise = apply_masking(premise_ids.copy())
+    masked_tokens_hypothesis, masked_pos_hypothesis = apply_masking(hypothesis_ids.copy())
 
-    # Pad sequences to max_seq_length
-    input_ids_a = (input_ids_a[:max_seq_length] + [0] * max_seq_length)[:max_seq_length]
-    input_ids_b = (input_ids_b[:max_seq_length] + [0] * max_seq_length)[:max_seq_length]
-    attention_a = [1 if token != 0 else 0 for token in input_ids_a]
-    attention_b = [1 if token != 0 else 0 for token in input_ids_b]
+    # Pad or truncate input IDs to MAX_SEQ_LENGTH
+    premise_ids = (premise_ids[:MAX_SEQ_LENGTH] + [0] * MAX_SEQ_LENGTH)[:MAX_SEQ_LENGTH]
+    hypothesis_ids = (hypothesis_ids[:MAX_SEQ_LENGTH] + [0] * MAX_SEQ_LENGTH)[:MAX_SEQ_LENGTH]
+
+    # Create attention masks (1 for real tokens, 0 for padding)
+    attention_premise = [1 if token != 0 else 0 for token in premise_ids]
+    attention_hypothesis = [1 if token != 0 else 0 for token in hypothesis_ids]
 
     return {
-        "premise_input_ids": [input_ids_a],
-        "premise_pos_mask": [masked_pos_a],
-        "hypothesis_input_ids": [input_ids_b],
-        "hypothesis_pos_mask": [masked_pos_b],
+        "premise_input_ids": [premise_ids],
+        "premise_pos_mask": [masked_pos_premise],
+        "hypothesis_input_ids": [hypothesis_ids],
+        "hypothesis_pos_mask": [masked_pos_hypothesis],
         "segment_ids": [segment_ids],
-        "attention_premise": [attention_a],
-        "attention_hypothesis": [attention_b],
+        "attention_premise": [attention_premise],
+        "attention_hypothesis": [attention_hypothesis],
     }
 
-def predict_nli_and_similarity(model, sentence_a, sentence_b, device):
-    # Tokenize input sentences
-    inputs = tokenize_sentence_model1(sentence_a, sentence_b)
+def calculate_similarity_s_model(model, sentence_a, sentence_b, device):
+    inputs = tokenize_sentence_s_model(sentence_a, sentence_b)
     
-    # Convert lists to tensors and move to device
+    # Convert inputs to tensors and send to device
     premise_ids = torch.tensor(inputs['premise_input_ids']).to(device)
-    pos_mask_a = torch.tensor(inputs['premise_pos_mask']).to(device)
-    attention_a = torch.tensor(inputs['attention_premise']).to(device)
+    pos_mask_premise = torch.tensor(inputs['premise_pos_mask']).to(device)
+    attention_premise = torch.tensor(inputs['attention_premise']).to(device)
     hypothesis_ids = torch.tensor(inputs['hypothesis_input_ids']).to(device)
-    pos_mask_b = torch.tensor(inputs['hypothesis_pos_mask']).to(device)
-    attention_b = torch.tensor(inputs['attention_hypothesis']).to(device)
+    pos_mask_hypothesis = torch.tensor(inputs['hypothesis_pos_mask']).to(device)
+    attention_hypothesis = torch.tensor(inputs['attention_hypothesis']).to(device)
     segments = torch.tensor(inputs['segment_ids']).to(device)
-    
-    # Get embeddings from model
+
+    # Remove extra batch dimension if necessary
+    premise_ids = premise_ids.squeeze(0) if premise_ids.dim() > 2 else premise_ids
+    hypothesis_ids = hypothesis_ids.squeeze(0) if hypothesis_ids.dim() > 2 else hypothesis_ids
+    segments = segments.squeeze(0) if segments.dim() > 2 else segments
+
     model.eval()
     with torch.no_grad():
-        u, _ = model(premise_ids, segments, pos_mask_a)
-        v, _ = model(hypothesis_ids, segments, pos_mask_b)
-    u_mean = mean_pool(u, attention_a)
-    v_mean = mean_pool(v, attention_b)
+        u, _ = model(premise_ids, segments, pos_mask_premise)
+        v, _ = model(hypothesis_ids, segments, pos_mask_hypothesis)
+
+    # Mean pooling and convert to numpy arrays for similarity computation
+    u_mean = mean_pool(u, attention_premise).detach().cpu().numpy().squeeze(0)
+    v_mean = mean_pool(v, attention_hypothesis).detach().cpu().numpy().squeeze(0)
+    similarity = cosine_similarity(u_mean.reshape(1, -1), v_mean.reshape(1, -1))[0, 0]
+    return similarity
+
+def predict_nli_and_similarity(model, classifier_head, sentence_a, sentence_b, device):
+    classifier_head = classifier_head.to(device)
+    inputs = tokenize_sentence_s_model(sentence_a, sentence_b)
     
+    # Convert inputs to tensors and move to device
+    premise_ids = torch.tensor(inputs['premise_input_ids']).to(device)
+    pos_mask_premise = torch.tensor(inputs['premise_pos_mask']).to(device)
+    attention_premise = torch.tensor(inputs['attention_premise']).to(device)
+    hypothesis_ids = torch.tensor(inputs['hypothesis_input_ids']).to(device)
+    pos_mask_hypothesis = torch.tensor(inputs['hypothesis_pos_mask']).to(device)
+    attention_hypothesis = torch.tensor(inputs['attention_hypothesis']).to(device)
+    segments = torch.tensor(inputs['segment_ids']).to(device)
+
+    with torch.no_grad():
+        u, _ = model(premise_ids, segments, pos_mask_premise)
+        v, _ = model(hypothesis_ids, segments, pos_mask_hypothesis)
+
+    u_mean = mean_pool(u, attention_premise)
+    v_mean = mean_pool(v, attention_hypothesis)
+
     # Compute cosine similarity
     u_np = u_mean.cpu().numpy().reshape(1, -1)
     v_np = v_mean.cpu().numpy().reshape(1, -1)
     similarity_score = cosine_similarity(u_np, v_np)[0, 0]
-    
-    # NLI prediction using a classifier head:
-    # Concatenate u, v, and |u-v|
-    uv_abs = torch.abs(u_mean - v_mean)
-    features = torch.cat([u_mean, v_mean, uv_abs], dim=-1)
-    
-    # Global classifier_head: adjust dimensions if needed (here 768*3 = 2304)
-    global classifier_head
+
+    # NLI classification
+    diff_abs = torch.abs(u_mean - v_mean)
+    features = torch.cat([u_mean, v_mean, diff_abs], dim=-1)
     with torch.no_grad():
         logits = classifier_head(features)
-        probs = F.softmax(logits, dim=-1)
-    # Map predictions to labels (update order as desired)
-    labels = ["Entailment", "Neutral", "Contradiction"]
-    nli_result = labels[torch.argmax(probs).item()]
-    
-    return {"similarity_score": similarity_score, "nli_label": nli_result}
+        probabilities = F.softmax(logits, dim=-1)
+    labels = ["contradiction", "neutral", "entailment"]
+    nli_result = labels[torch.argmax(probabilities).item()]
 
-@st.cache(allow_output_mutation=True)
-def load_bert_model():
-    model = BERT()
-    model.load_state_dict(torch.load('models/BERT-model.pt', map_location=torch.device('cpu')))
-    model.eval()
-    return model
+    return similarity_score, nli_result
+
 
 @st.cache(allow_output_mutation=True)
 def load_sbert_model():
-    model = BERT()  # Replace with your SBERT class if different
-    model.load_state_dict(torch.load('models/SBERT-model.pt', map_location=torch.device('cpu')))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # Use GPU if available
+    model = BERT().to(device)  # Move model to the correct device
+    model.load_state_dict(torch.load('models/SBERT-model.pt', map_location=device))
     model.eval()
     return model
 
 # Define and initialize the classifier head (assumes d_model=23069)
 classifier_head = torch.nn.Linear(23069 * 3, 3)
+classifier_head.to(device)
+
 
 # ------------------------------------------------
 # Streamlit App UI
@@ -270,14 +339,14 @@ sentence_b = st.text_input("Sentence B:")
 
 if st.button("Predict"):
     if sentence_a and sentence_b:
-        # Load your BERT model (for NLI prediction)
-        bert_model = load_bert_model()
-        # (Optionally, you can load the SBERT model if you want to use it for similarity)
-        # sbert_model = load_sbert_model()
+        # Load BERT model (for NLI prediction)
+        bert_model = load_sbert_model()
+       
         
-        results = predict_nli_and_similarity(bert_model, sentence_a, sentence_b, device='cpu')
-        similarity = results["similarity_score"]
-        nli_prediction = results["nli_label"]
+        results = predict_nli_and_similarity(bert_model, classifier_head, sentence_a, sentence_b, device)
+
+        similarity = results[0]
+        nli_prediction = results[1]
         
         st.write(f"**Cosine Similarity:** {similarity:.4f}")
         st.write(f"**NLI Prediction:** {nli_prediction}")
